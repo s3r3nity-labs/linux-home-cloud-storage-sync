@@ -1,0 +1,67 @@
+# ONE-TIME: copies the Flatpak signing key from this repository's secret into the
+# organization secret FLATPAK_GPG_PRIVATE_KEY (for linux-home-cloud-storage-sync and
+# mangohud-fps-switch), without the key showing up anywhere. Runs on a push to the
+# copy-gpg-key branch only; delete the branch afterwards, it never goes to main.
+#
+# Needs, temporarily, in this repository:
+# - ORG_SECRETS_TOKEN: fine-grained token, resource owner s3r3nity-labs, organization
+#   permission "Secrets: Read and write", 1 day
+# - KEY_BACKUP_PASSPHRASE (optional): also export the key encrypted with this passphrase
+#   as a downloadable artifact (kept 1 day), for a backup in Bitwarden
+name: Copy GPG key (one-time)
+
+on:
+  push:
+    branches: [copy-gpg-key]
+
+permissions:
+  contents: read
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    env:
+      KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+      FINGERPRINT: DA8B9C3EE876F9AFB53D4D4A0424DDA699CD08FE
+    steps:
+      - name: Check it's the signing key
+        run: |
+          if [ -z "$KEY" ]; then echo "FLATPAK_GPG_PRIVATE_KEY is empty here"; exit 1; fi
+          export GNUPGHOME=$(mktemp -d)
+          printf '%s\n' "$KEY" | gpg --batch --quiet --import
+          fprs=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10}')
+          echo "Secret key fingerprints: $fprs"
+          if ! grep -qx "$FINGERPRINT" <<<"$fprs"; then echo "Not the key $FINGERPRINT"; exit 1; fi
+          rm -rf "$GNUPGHOME"
+
+      - name: Set the organization secret
+        env:
+          GH_TOKEN: ${{ secrets.ORG_SECRETS_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "ORG_SECRETS_TOKEN is missing"; exit 1; fi
+          # From stdin, not as an argument: the key never appears in a command line
+          printf '%s\n' "$KEY" | gh secret set FLATPAK_GPG_PRIVATE_KEY --org s3r3nity-labs \
+            --visibility selected --repos linux-home-cloud-storage-sync,mangohud-fps-switch
+          gh secret list --org s3r3nity-labs
+
+      - name: Encrypted backup (only with KEY_BACKUP_PASSPHRASE)
+        id: backup
+        env:
+          PASSPHRASE: ${{ secrets.KEY_BACKUP_PASSPHRASE }}
+        run: |
+          if [ -z "$PASSPHRASE" ]; then echo "No KEY_BACKUP_PASSPHRASE: no backup"; exit 0; fi
+          export GNUPGHOME=$(mktemp -d)
+          mkdir -p backup
+          # Passphrase through a file descriptor, not the command line
+          printf '%s\n' "$KEY" | gpg --batch --symmetric --cipher-algo AES256 --armor \
+            --pinentry-mode loopback --passphrase-fd 3 \
+            --output backup/flatpak-signing-key.asc.gpg 3<<<"$PASSPHRASE"
+          rm -rf "$GNUPGHOME"
+          echo "made=true" >> "$GITHUB_OUTPUT"
+
+      - if: steps.backup.outputs.made == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak-signing-key-backup
+          path: backup/flatpak-signing-key.asc.gpg
+          retention-days: 1
